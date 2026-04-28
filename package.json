@@ -1,0 +1,16 @@
+{
+  "name": "gravitational-context-fields-workspace",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node repos/gcf-chatbot/server.js",
+    "start:api": "node repos/gcf-chatbot/server.js",
+    "demo": "node repos/gcf-lab/src/run-demo.js",
+    "test": "node repos/gcf-core/src/self-test.js"
+  },
+  "workspaces": [
+    "repos/gcf-core",
+    "repos/gcf-chatbot",
+    "repos/gcf-lab"
+  ]
+}

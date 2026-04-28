@@ -1,0 +1,9 @@
+{
+  "name": "@gcf/core",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node src/self-test.js"
+  }
+}

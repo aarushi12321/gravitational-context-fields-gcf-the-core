@@ -221,6 +221,8 @@ async function handleApi(request, response, url) {
       return;
     }
 
+    // contextualization is handled locally in the client (no extra model call)
+
     sendJson(response, 404, { error: "Unknown API route." });
   } catch (error) {
     logDebug("error", "api.error", {

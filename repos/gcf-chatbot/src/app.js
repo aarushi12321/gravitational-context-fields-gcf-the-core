@@ -571,26 +571,30 @@ async function assemblePrompt(query, vector, momentum) {
     refilled,
   );
   const responseChunk = addResponseMemoryChunk(query, llmAnswer, vector);
-  const responseSubChunks = segmentResponseIntoChunks(
-    llmAnswer,
-    query,
-    responseChunk.id,
-  );
-  const writtenResponseChunks = writeResponseChunksToMemory(
-    responseSubChunks,
-    vector,
-  );
+  let writtenKnowledge = [];
+  try {
+    const extracted = extractKnowledgeUnitsLocal(llmAnswer, query, 24);
+    writtenKnowledge = writeKnowledgeChunksToMemory(extracted, vector);
+  } catch (error) {
+    addEvent("FIELD-UPDATE", "CTX-ERR", error.message || String(error));
+    const responseSubChunks = segmentResponseIntoChunks(
+      llmAnswer,
+      query,
+      responseChunk.id,
+    );
+    writtenKnowledge = writeResponseChunksToMemory(responseSubChunks, vector);
+  }
   addEvent(
     "FIELD-UPDATE",
     "CHUNKING",
-    `created ${responseSubChunks.length} response sub-chunks`,
+    `contextualized ${writtenKnowledge.length} knowledge chunks`,
   );
   const answerHtml = renderAnswerHtml(llmAnswer, cited, responseChunk);
   state.outputs.unshift({
     query,
     answerText: llmAnswer,
     answerHtml,
-    memoryWrites: [responseChunk.id, ...writtenResponseChunks.map((c) => c.id)],
+    memoryWrites: [responseChunk.id, ...writtenKnowledge.map((c) => c.id)],
     citedIds: cited.map((chunk) => chunk.id),
     cachedId: responseChunk.id,
     cachedTier: responseChunk.tier,
@@ -601,10 +605,244 @@ async function assemblePrompt(query, vector, momentum) {
   animateFlights(selected);
 }
 
+function extractKnowledgeUnitsLocal(answer, query, maxChunks = 12) {
+  // Structure-aware, lossless chunking: keep ALL meaning, but split along natural
+  // boundaries (headings, list items, paragraphs). If we exceed maxChunks, we merge
+  // adjacent chunks rather than dropping content.
+  const safeMax = Math.min(60, Math.max(6, Number(maxChunks) || 12));
+  const text = String(answer || "").replace(/\r\n/g, "\n").trim();
+  if (!text) return [];
+
+  // 1) Split into blocks while preserving headings.
+  const blocks = [];
+  for (const raw of text.split("\n")) {
+    blocks.push(raw);
+  }
+
+  // 2) Build semantic units from blocks (headings, list items, paragraphs).
+  const units = [];
+  let paraBuf = [];
+  const flushPara = () => {
+    const p = paraBuf.join("\n").trim();
+    if (p) units.push(p);
+    paraBuf = [];
+  };
+
+  for (let idx = 0; idx < blocks.length; idx++) {
+    const line = blocks[idx];
+    const t = String(line || "").trim();
+    if (!t) {
+      flushPara();
+      continue;
+    }
+
+    const heading = t.match(/^#{1,3}\s+(.+)$/);
+    if (heading) {
+      flushPara();
+      units.push(heading[1].trim());
+      continue;
+    }
+
+    // list items become their own units; continuation lines stick to the last item.
+    if (/^\d+\.\s+/.test(t) || /^[-*]\s+/.test(t)) {
+      flushPara();
+      const cleaned = t.replace(/^(?:\d+\.\s+|[-*]\s+)/, "").trim();
+      if (cleaned) units.push(cleaned);
+      continue;
+    }
+
+    // Continuation lines: attach to the previous list item if it exists and we just had a list.
+    if (units.length && paraBuf.length === 0) {
+      const prev = units[units.length - 1];
+      if (prev && (estimateTokens(prev) < CHUNK_TOKENS_TARGET)) {
+        // If the previous unit is short, treat this as a continuation (keeps meaning together).
+        units[units.length - 1] = `${prev} ${t}`.trim();
+        continue;
+      }
+    }
+
+    paraBuf.push(t);
+  }
+  flushPara();
+
+  // 3) Ensure standalone meaning: if a unit begins with a pronoun/connector,
+  // glue the previous unit (when possible).
+  const connected = [];
+  for (const unit of units) {
+    const u = unit.trim();
+    if (!u) continue;
+    const startsDependent = /^(it|this|that|these|those|they|he|she|also|so|then|however|therefore|because)\b/i.test(
+      u,
+    );
+    if (
+      startsDependent &&
+      connected.length &&
+      estimateTokens(`${connected[connected.length - 1]} ${u}`) <=
+        CHUNK_TOKENS_MAX
+    ) {
+      connected[connected.length - 1] = `${connected[connected.length - 1]} ${u}`.trim();
+    } else {
+      connected.push(u);
+    }
+  }
+
+  // 4) Chunk each connected unit into max-sized pieces (lossless), then lightly pack
+  // adjacent small pieces (to reduce fragmentation).
+  const pieces = [];
+  for (const unit of connected) {
+    if (estimateTokens(unit) <= CHUNK_TOKENS_MAX) {
+      pieces.push(unit.trim());
+    } else {
+      pieces.push(...splitTextIntoMaxTokenChunks(unit, CHUNK_TOKENS_MAX));
+    }
+  }
+
+  const packed = [];
+  let buf = "";
+  for (const piece of pieces) {
+    const cand = buf ? `${buf}\n${piece}` : piece;
+    if (!buf) {
+      buf = piece;
+      continue;
+    }
+    if (
+      estimateTokens(cand) <= CHUNK_TOKENS_TARGET &&
+      estimateTokens(buf) < CHUNK_TOKENS_MIN
+    ) {
+      buf = cand;
+      continue;
+    }
+    packed.push(buf.trim());
+    buf = piece;
+  }
+  if (buf.trim()) packed.push(buf.trim());
+
+  // 5) Normalize metadata.
+  const out = packed.map((content) => {
+    const normalized = limitChunkSize(content, CHUNK_TOKENS_MAX);
+    return {
+      cluster: inferClusterSlug(query, normalized),
+      keywords: extractKeywords(`${query} ${normalized}`),
+      content: normalized,
+      tokens: Math.min(CHUNK_TOKENS_MAX, estimateTokens(normalized)),
+    };
+  });
+
+  // If we exceed max chunks, merge adjacent chunks (lossless) rather than dropping.
+  if (out.length <= safeMax) return out;
+  const merged = [];
+  let cur = "";
+  for (const item of out) {
+    const cand = cur ? `${cur}\n${item.content}` : item.content;
+    // Prefer merging until we hit max.
+    if (estimateTokens(cand) <= CHUNK_TOKENS_MAX && merged.length + 1 < safeMax) {
+      cur = cand;
+    } else {
+      if (cur) merged.push(cur.trim());
+      cur = item.content;
+    }
+  }
+  if (cur.trim()) merged.push(cur.trim());
+  return merged.map((content) => {
+    const normalized = limitChunkSize(content, CHUNK_TOKENS_MAX);
+    return {
+      cluster: inferClusterSlug(query, normalized),
+      keywords: extractKeywords(`${query} ${normalized}`),
+      content: normalized,
+      tokens: Math.min(CHUNK_TOKENS_MAX, estimateTokens(normalized)),
+    };
+  });
+}
+
+function inferClusterSlug(query, content) {
+  const t = `${String(query || "")} ${String(content || "")}`.toLowerCase();
+  if (/\btcp\b|\bcongestion\b|\back\b|\bretrans/i.test(t)) return "networking";
+  if (/\btransformer\b|\bembedding\b|\battention\b/i.test(t)) return "ml";
+  if (/\bdatabase\b|\bindex\b|\bjoin\b/i.test(t)) return "databases";
+  if (/\broman\b|\bempire\b|\bhistory\b/i.test(t)) return "history";
+  if (/\bferment\b|\byeast\b|\bcook\b/i.test(t)) return "cooking";
+  return "response-knowledge";
+}
+
+function nextCId() {
+  // Find the highest C#### id we currently have; append after it.
+  let max = 0;
+  for (const chunk of state.committedChunks) {
+    const m = String(chunk.id || "").match(/^C(\d{4})$/);
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return `C${String(max + 1).padStart(4, "0")}`;
+}
+
+function writeKnowledgeChunksToMemory(extracted, queryVector) {
+  const items = Array.isArray(extracted) ? extracted : [];
+  if (!items.length) return [];
+  const now = performance.now();
+  const written = [];
+
+  for (const item of items) {
+    const id = nextCId();
+    const content = limitChunkSize(String(item.content || ""), CHUNK_TOKENS_MAX);
+    const vector = textVector(content);
+    const pull = Math.max(0, cosine(queryVector, vector));
+    const gravity = clamp(0.48 + pull * 0.46, 0.18, 0.92);
+    const tier = tierForGravity(gravity);
+    const chunk = {
+      id,
+      index: state.committedChunks.length,
+      cluster: item.cluster || "response-knowledge",
+      keywords: Array.isArray(item.keywords) ? item.keywords : extractKeywords(content),
+      content,
+      vector,
+      gravity,
+      tier,
+      previousTier: 4,
+      tokens: Math.max(20, Math.min(CHUNK_TOKENS_MAX, Number(item.tokens) || estimateTokens(content))),
+      accessCount: 1,
+      lastPromotedAt: now,
+      lastChangedAt: now,
+      flashUntil: now + 2000,
+      gravityHistory: [gravity],
+    };
+    state.committedChunks.push(chunk);
+    written.push(chunk);
+    addEvent("PAGE-IN", chunk.id, `knowledge write L${tier} gravity=${gravity.toFixed(2)}`);
+  }
+
+  state.chunks = cloneChunks(state.committedChunks);
+  return written;
+}
+
 function segmentResponseIntoChunks(response, query, responseId) {
   const normalized = String(response || "").trim();
   addEvent("FIELD-UPDATE", "CHUNKING", `segmenting ${normalized.length} chars`);
   if (!normalized) return [];
+
+  // If the response contains a numbered list, prefer extracting each list item
+  // as an atomic knowledge chunk.
+  const listItemMatches = normalized.match(/^\s*\d+\.\s+/gm);
+  if (listItemMatches && listItemMatches.length >= 3) {
+    const items = normalized
+      .split(/\n+/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .filter((line) => /^\d+\.\s+/.test(line))
+      .map((line) => line.replace(/^\d+\.\s+/, "").trim())
+      .filter((line) => line.length > 18);
+
+    if (items.length >= 3) {
+      return items.map((item) => {
+        const content = item;
+        return {
+          id: nextCId(),
+          cluster: "response-fact",
+          keywords: extractKeywords(content),
+          content,
+          tokens: estimateTokens(content),
+        };
+      });
+    }
+  }
 
   // Prefer paragraph structure when present; fallback to sentence boundaries.
   const paragraphs = normalized
@@ -628,7 +866,7 @@ function segmentResponseIntoChunks(response, query, responseId) {
     const text = current.trim();
     if (!text) return;
     chunks.push({
-      id: `${responseId}-${String(chunkIndex + 1).padStart(2, "0")}`,
+      id: nextCId(),
       cluster: "response-segment",
       keywords: extractKeywords(text),
       content: text,
@@ -734,11 +972,9 @@ function writeResponseChunksToMemory(responseSubChunks, queryVector) {
 
 function addResponseMemoryChunk(query, answer, queryVector) {
   const index = state.committedChunks.length;
-  const id = `R${String(state.outputs.length + 1).padStart(4, "0")}`;
-  const content = limitChunkSize(
-    `User asked: ${query}\nAnswer:\n${String(answer || "").trim()}`,
-    CHUNK_TOKENS_MAX,
-  );
+  const id = nextCId();
+  const compactAnswer = compactAnswerForMemory(String(answer || "").trim(), 2);
+  const content = limitChunkSize(`Q: ${String(query || "").trim()}\nA: ${compactAnswer}`, CHUNK_TOKENS_MAX);
   const vector = textVector(content);
   const pull = Math.max(0, cosine(queryVector, vector));
   const gravity = clamp(0.62 + pull * 0.3, 0, 0.92);
@@ -770,6 +1006,17 @@ function addResponseMemoryChunk(query, answer, queryVector) {
   return chunk;
 }
 
+function compactAnswerForMemory(answer, maxSentences = 2) {
+  const text = String(answer || "").replace(/\r\n/g, "\n").trim();
+  if (!text) return "";
+  const sentences = text
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const kept = sentences.slice(0, Math.max(1, maxSentences)).join(" ");
+  return kept || text.slice(0, 240);
+}
+
 function renderAnswerHtml(
   answer,
   cited,
@@ -799,10 +1046,109 @@ function renderAnswerHtml(
 }
 
 function formatAnswerText(answer) {
-  return escapeHtml(answer)
-    .split(/\n{2,}/)
-    .map((paragraph) => `<p>${paragraph.replace(/\n/g, "<br>")}</p>`)
+  return renderMarkdownLite(String(answer || ""));
+}
+
+function renderMarkdownLite(text) {
+  // Safe, tiny markdown-ish renderer for model responses.
+  // Supports: headings (#..###), **bold**, *italics*, `code`, bullet + numbered lists.
+  const src = String(text || "").replace(/\r\n/g, "\n").trim();
+  if (!src) return `<p class="muted">No response.</p>`;
+
+  const lines = src.split("\n");
+  const blocks = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) {
+      i += 1;
+      continue;
+    }
+
+    // Headings
+    const h = line.match(/^\s*(#{1,3})\s+(.+)$/);
+    if (h) {
+      blocks.push({ type: "heading", level: h[1].length, text: h[2] });
+      i += 1;
+      continue;
+    }
+
+    // Numbered list (treat blank lines between items as still part of the list)
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length) {
+        const current = lines[i];
+        if (!current.trim()) {
+          i += 1;
+          continue;
+        }
+        if (!/^\s*\d+\.\s+/.test(current)) break;
+        items.push(current.replace(/^\s*\d+\.\s+/, "").trim());
+        i += 1;
+      }
+      blocks.push({ type: "ol", items });
+      continue;
+    }
+
+    // Bullet list (treat blank lines between items as still part of the list)
+    if (/^\s*[-*]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length) {
+        const current = lines[i];
+        if (!current.trim()) {
+          i += 1;
+          continue;
+        }
+        if (!/^\s*[-*]\s+/.test(current)) break;
+        items.push(current.replace(/^\s*[-*]\s+/, "").trim());
+        i += 1;
+      }
+      blocks.push({ type: "ul", items });
+      continue;
+    }
+
+    // Paragraph until blank line.
+    const para = [];
+    while (i < lines.length && lines[i].trim()) {
+      para.push(lines[i]);
+      i += 1;
+    }
+    blocks.push({ type: "p", text: para.join("\n") });
+  }
+
+  return blocks
+    .map((block) => {
+      if (block.type === "heading") {
+        const level = block.level;
+        return `<h3 class="md-h md-h${level}">${inlineMarkdown(block.text)}</h3>`;
+      }
+      if (block.type === "ol") {
+        const items = block.items
+          .map((item) => `<li>${inlineMarkdown(item)}</li>`)
+          .join("");
+        return `<ol class="md-ol">${items}</ol>`;
+      }
+      if (block.type === "ul") {
+        const items = block.items
+          .map((item) => `<li>${inlineMarkdown(item)}</li>`)
+          .join("");
+        return `<ul class="md-ul">${items}</ul>`;
+      }
+      return `<p class="md-p">${inlineMarkdown(block.text).replace(/\n/g, "<br>")}</p>`;
+    })
     .join("");
+}
+
+function inlineMarkdown(text) {
+  const escaped = escapeHtml(String(text || ""));
+  // inline code
+  const coded = escaped.replace(/`([^`]+)`/g, "<code>$1</code>");
+  // bold
+  const bolded = coded.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  // italics (simple, non-greedy)
+  const ital = bolded.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+  return ital;
 }
 
 function selectMemoryContext(tokenBudget = 4096) {

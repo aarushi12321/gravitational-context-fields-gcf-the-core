@@ -467,18 +467,22 @@ h2 {
 }
 
 .citation {
-  display: inline;
-  border: 0;
-  background: transparent;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid color-mix(in srgb, var(--l1) 40%, var(--line-soft));
+  background: color-mix(in srgb, var(--l1) 10%, #0b111d);
   color: var(--l1);
   font-family: "SFMono-Regular", Consolas, monospace;
-  font-weight: 700;
+  font-weight: 800;
   cursor: pointer;
-  padding: 0;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 12px;
 }
 
 .citation:hover {
-  text-decoration: underline;
+  box-shadow: 0 0 12px #f59e0b44;
+  border-color: color-mix(in srgb, var(--l1) 70%, var(--line-soft));
 }
 
 .answer-cites {
@@ -512,22 +516,90 @@ h2 {
 
 .response-card header span {
   color: var(--l2);
-  font-size: 10px;
+  font-size: 11px;
   letter-spacing: 0.08em;
 }
 
 .response-card header strong {
   color: var(--l1);
-  font-size: 10px;
+  font-size: 11px;
 }
 
 .response-body {
-  padding: 0 10px;
+  padding: 0 12px;
   color: #e5edf8;
 }
 
 .response-body p {
-  margin: 0 0 8px;
+  margin: 0 0 10px;
+}
+
+.response-body strong {
+  color: #f1f5ff;
+  font-weight: 800;
+}
+
+.response-body em {
+  color: #cbd5e1;
+  font-style: italic;
+}
+
+.response-body code {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  background: #080c16;
+  border: 1px solid var(--line-soft);
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: color-mix(in srgb, var(--l2) 55%, #e5edf8);
+}
+
+.md-h {
+  margin: 2px 0 8px;
+  font-size: 12px;
+  letter-spacing: 0;
+  font-weight: 900;
+  color: #f1f5ff;
+}
+
+.md-h2 {
+  font-size: 12px;
+}
+
+.md-h3 {
+  font-size: 12px;
+}
+
+.md-p {
+  margin: 0 0 12px;
+  color: #d8e1ee;
+  line-height: 1.7;
+  font-size: 14px;
+}
+
+.md-ul,
+.md-ol {
+  margin: 0 0 12px;
+  padding-left: 18px;
+  display: grid;
+  gap: 6px;
+}
+
+.md-ul li,
+.md-ol li {
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--l4) 6%, #0b111d);
+  border: 1px solid var(--line-soft);
+  border-radius: 5px;
+  color: #d8e1ee;
+  line-height: 1.65;
+  font-size: 14px;
+}
+
+.md-ol li::marker {
+  color: var(--l1);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-weight: 900;
 }
 
 .response-sub-chunks {
@@ -601,17 +673,17 @@ h2 {
   min-height: 0;
   overflow: auto;
   display: grid;
-  gap: 10px;
+  gap: 12px;
 }
 
 .query-output {
   border: 1px solid var(--line-soft);
   background: transparent;
   padding: 0;
-  font-size: 11px;
-  line-height: 1.5;
+  font-size: 13px;
+  line-height: 1.6;
   display: grid;
-  gap: 8px;
+  gap: 10px;
 }
 
 .empty-output {
@@ -628,7 +700,7 @@ h2 {
   display: flex;
   gap: 8px;
   align-items: center;
-  padding: 8px 10px;
+  padding: 10px 12px;
   background: #0d1320;
   border: 1px solid var(--line-soft);
   border-radius: 4px 4px 0 0;
@@ -636,7 +708,7 @@ h2 {
 
 .output-head strong {
   color: var(--l2);
-  font-size: 10px;
+  font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   min-width: 40px;
@@ -651,7 +723,7 @@ h2 {
 
 .output-body {
   display: grid;
-  gap: 8px;
+  gap: 10px;
 }
 
 .output-section {
@@ -662,10 +734,10 @@ h2 {
 }
 
 .output-section-head {
-  padding: 7px 10px;
+  padding: 9px 12px;
   background: color-mix(in srgb, var(--tier-color) 12%, #0b111d);
   border-bottom: 1px solid var(--line-soft);
-  font-size: 9px;
+  font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--tier-color);
@@ -673,8 +745,31 @@ h2 {
 }
 
 .output-section-content {
-  padding: 10px;
+  padding: 12px;
   color: #cdd6e4;
+}
+
+/* Panel 3 legibility bump */
+.io-panel {
+  font-size: 13px;
+}
+
+.io-panel .panel-head h2 {
+  font-size: 15px;
+}
+
+.io-panel .assembler-head {
+  font-size: 12px;
+}
+
+.response-card header,
+.response-card footer {
+  padding: 10px 12px;
+}
+
+.response-body {
+  font-size: 14px;
+  line-height: 1.7;
 }
 
 .chat-form {

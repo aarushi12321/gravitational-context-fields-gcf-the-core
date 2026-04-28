@@ -31,67 +31,50 @@
           <div id="tierLanes" class="tier-lanes"></div>
         </section>
 
-        <section class="center-stack">
-          <section
-            class="panel heatmap-panel"
-            aria-label="Gravity field heatmap"
-          >
-            <div class="panel-head compact">
-              <div>
-                <p class="kicker">Panel 2</p>
-                <h2>Gravity Field Heatmap</h2>
-              </div>
-              <span class="mono">10 x 10 chunk grid</span>
-            </div>
-            <div class="axis-label x-axis">x = chunk index</div>
-            <div class="heatmap-wrap">
-              <div class="axis-label y-axis">y = semantic cluster group</div>
-              <div id="heatmap" class="heatmap"></div>
-            </div>
-          </section>
-
-          <section
-            class="panel inspector-panel-2"
-            aria-label="Chunk inspector and event log"
-          >
-            <div class="inspector-top">
-              <div class="panel-head compact">
-                <div>
-                  <p class="kicker">Panel 3</p>
-                  <h2>Chunk Inspector</h2>
-                </div>
-                <span id="selectedBadge" class="mono selected-badge">none</span>
-              </div>
-              <div id="chunkInspector" class="chunk-inspector"></div>
-            </div>
-            <div class="event-section">
-              <div class="panel-head compact">
-                <div>
-                  <p class="kicker">Live</p>
-                  <h2>Event Log</h2>
-                </div>
-                <span class="mono">newest first</span>
-              </div>
-              <div id="eventLog" class="event-log"></div>
-            </div>
-          </section>
-        </section>
+        <div
+          class="splitter"
+          data-splitter="left"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize memory map panel"
+        ></div>
 
         <section
-          class="panel convo-panel"
-          aria-label="Conversation and response"
+          class="panel heatmap-panel"
+          aria-label="Gravity field heatmap"
         >
           <div class="panel-head compact">
             <div>
-              <p class="kicker">Panel 4</p>
-              <h2>Conversation + Response</h2>
+              <p class="kicker">Panel 2</p>
+              <h2>Gravity Field Heatmap</h2>
+            </div>
+            <span class="mono">10 x 10 chunk grid</span>
+          </div>
+          <div class="axis-label x-axis">x = chunk index</div>
+          <div class="heatmap-wrap">
+            <div class="axis-label y-axis">y = semantic cluster group</div>
+            <div id="heatmap" class="heatmap"></div>
+          </div>
+        </section>
+
+        <div
+          class="splitter"
+          data-splitter="right"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize model console panel"
+        ></div>
+
+        <section class="panel io-panel" aria-label="Query outputs and input">
+          <div class="panel-head compact">
+            <div>
+              <p class="kicker">Panel 3</p>
+              <h2>Model Console</h2>
             </div>
             <button id="randomTurnBtn" class="secondary-btn" type="button">
               Inject random turn
             </button>
           </div>
-          <div id="turnPills" class="turn-pills"></div>
-          <div id="answer" class="answer"></div>
           <div class="query-output-wrap">
             <div class="assembler-head">
               <span class="mono">chat history</span>

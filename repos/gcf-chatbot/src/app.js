@@ -15,6 +15,11 @@ const TIER_META = {
   },
 };
 
+// Standardize memory chunk size (approx tokens; we estimate tokens from words).
+const CHUNK_TOKENS_TARGET = 110;
+const CHUNK_TOKENS_MIN = 80;
+const CHUNK_TOKENS_MAX = 140;
+
 const state = {
   chunks: [],
   committedChunks: [],
@@ -23,6 +28,8 @@ const state = {
   selectedId: "C0001",
   lastFieldUpdate: null,
   lastQuery: "",
+  lastPromptContext: "",
+  lastSelectedContextIds: [],
   previewText: "",
   previewMode: false,
   startTime: performance.now(),
@@ -38,18 +45,14 @@ const state = {
 const refs = {
   stats: document.querySelector("#stats"),
   fieldAge: document.querySelector("#fieldAge"),
+  dashboard: document.querySelector(".dashboard"),
   tierLanes: document.querySelector("#tierLanes"),
   heatmap: document.querySelector("#heatmap"),
-  turnPills: document.querySelector("#turnPills"),
   promptContext: document.querySelector("#promptContext"),
-  answer: document.querySelector("#answer"),
   queryOutputs: document.querySelector("#queryOutputs"),
   chatForm: document.querySelector("#chatForm"),
   chatInput: document.querySelector("#chatInput"),
   randomTurnBtn: document.querySelector("#randomTurnBtn"),
-  inspector: document.querySelector("#chunkInspector"),
-  selectedBadge: document.querySelector("#selectedBadge"),
-  eventLog: document.querySelector("#eventLog"),
   assemblyState: document.querySelector("#assemblyState"),
   assemblyFlights: document.querySelector("#assemblyFlights"),
   modal: document.querySelector("#chunkModal"),
@@ -63,6 +66,7 @@ init();
 async function init() {
   console.log("[GCF] init start", { href: location.href });
   bindEvents();
+  initResizablePanels();
   addEvent("FIELD-UPDATE", "boot", "checking api");
   render();
   console.log("[GCF] calling loadLlmSeeds");
@@ -115,11 +119,133 @@ function bindEvents() {
 
 }
 
+function initResizablePanels() {
+  if (!refs.dashboard) return;
+
+  const stored = readLayout();
+  if (stored) applyLayout(stored);
+
+  const splitters = Array.from(
+    document.querySelectorAll(".splitter[data-splitter]"),
+  );
+  splitters.forEach((splitter) => {
+    splitter.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      beginResize(splitter.dataset.splitter, event);
+    });
+  });
+
+  function beginResize(which, event) {
+    if (!refs.dashboard) return;
+    if (!event.isPrimary) return;
+
+    const dashRect = refs.dashboard.getBoundingClientRect();
+    const kids = Array.from(refs.dashboard.children).filter(
+      (el) => el.classList && el.classList.contains("panel"),
+    );
+    const [leftPanel, midPanel, rightPanel] = kids;
+    if (!leftPanel || !midPanel || !rightPanel) return;
+
+    const leftRect = leftPanel.getBoundingClientRect();
+    const midRect = midPanel.getBoundingClientRect();
+    const rightRect = rightPanel.getBoundingClientRect();
+    const startX = event.clientX;
+    const start = {
+      left: leftRect.width,
+      mid: midRect.width,
+      right: rightRect.width,
+      total: dashRect.width,
+    };
+
+    const minLeft = 260;
+    const minMid = 320;
+    const minRight = 280;
+
+    document.body.classList.add("resizing");
+    const handle = event.currentTarget;
+    if (handle && handle.classList) handle.classList.add("dragging");
+    try {
+      handle?.setPointerCapture?.(event.pointerId);
+    } catch (_) {}
+
+    const onMove = (moveEvent) => {
+      const dx = moveEvent.clientX - startX;
+      let left = start.left;
+      let mid = start.mid;
+      let right = start.right;
+
+      if (which === "left") {
+        left = clamp(start.left + dx, minLeft, start.total - minMid - minRight);
+        mid = clamp(start.mid - dx, minMid, start.total - left - minRight);
+      } else {
+        mid = clamp(start.mid + dx, minMid, start.total - minLeft - minRight);
+        right = clamp(
+          start.right - dx,
+          minRight,
+          start.total - minLeft - mid,
+        );
+      }
+
+      const layout = {
+        leftPx: Math.round(left),
+        midPx: Math.round(mid),
+        rightPx: Math.round(right),
+      };
+      applyLayout(layout);
+      writeLayout(layout);
+    };
+
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      document.body.classList.remove("resizing");
+      if (handle && handle.classList) handle.classList.remove("dragging");
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp, { once: true });
+  }
+
+  function applyLayout(layout) {
+    if (!refs.dashboard) return;
+    const { leftPx, midPx, rightPx } = layout || {};
+    if (Number.isFinite(leftPx))
+      refs.dashboard.style.setProperty("--col-left", `${leftPx}px`);
+    if (Number.isFinite(midPx))
+      refs.dashboard.style.setProperty("--col-mid", `${midPx}px`);
+    if (Number.isFinite(rightPx))
+      refs.dashboard.style.setProperty("--col-right", `${rightPx}px`);
+  }
+
+  function readLayout() {
+    try {
+      const raw = localStorage.getItem("gcf.layout.v1");
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed) return null;
+      if (
+        !Number.isFinite(parsed.leftPx) ||
+        !Number.isFinite(parsed.midPx) ||
+        !Number.isFinite(parsed.rightPx)
+      )
+        return null;
+      return parsed;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function writeLayout(layout) {
+    try {
+      localStorage.setItem("gcf.layout.v1", JSON.stringify(layout));
+    } catch (_) {}
+  }
+}
+
 async function loadLlmSeeds() {
   state.loading = true;
   state.lastSeedError = "";
   if (refs.assemblyState) refs.assemblyState.textContent = "requesting LLM seed memory";
-  if (refs.answer) refs.answer.textContent = "Loading initial memory from the LLM...";
   render();
   try {
     const status = await apiGet("/api/status");
@@ -131,13 +257,11 @@ async function loadLlmSeeds() {
       throw new Error("OPENAI_API_KEY is not configured on the local server.");
     }
     await hydrateSeedBatches(96, 8, 6);
-    if (refs.answer) refs.answer.textContent = `LLM seed memory loaded: ${state.committedChunks.length}/96 chunks. Submit a query to assemble context and call the base model.`;
   } catch (error) {
     state.committedChunks = [];
     state.chunks = [];
     state.lastSeedError = error.message || String(error);
     addEvent("FIELD-UPDATE", "API-NEEDED", error.message);
-    if (refs.answer) refs.answer.textContent = `${error.message} Start the server with OPENAI_API_KEY to let the LLM seed and answer from memory.`;
     if (refs.promptContext) {
       refs.promptContext.textContent =
         "No fake chunks loaded. Waiting for live LLM seed memory.";
@@ -152,7 +276,6 @@ async function hydrateSeedBatches(targetCount, batchSize, concurrency) {
   state.committedChunks = [];
   state.chunks = [];
   state.selectedId = "";
-  if (refs.answer) refs.answer.textContent = `Hydrating LLM memory in parallel: 0/${targetCount} chunks loaded...`;
   addEvent(
     "FIELD-UPDATE",
     "LLM-SEED",
@@ -195,7 +318,6 @@ async function hydrateSeedBatches(targetCount, batchSize, concurrency) {
           state.committedChunks.sort((a, b) => a.index - b.index);
           state.chunks = cloneChunks(state.committedChunks);
           state.selectedId ||= state.chunks[0]?.id || "";
-          refs.answer.textContent = `Hydrating LLM memory in parallel: ${state.committedChunks.length}/${targetCount} chunks loaded...`;
           addEvent(
             "PAGE-IN",
             `seed-${job.offset + 1}`,
@@ -211,7 +333,7 @@ async function hydrateSeedBatches(targetCount, batchSize, concurrency) {
         } catch (error) {
           state.lastSeedError = error.message || String(error);
           addEvent("FIELD-UPDATE", "SEED-ERR", error.message);
-          renderEventLog();
+          render();
         }
       }
     },
@@ -239,7 +361,7 @@ function normalizeApiChunk(chunk, index) {
         : tier === 3
           ? 0.18 + seeded(index) * 0.08
           : seeded(index) * 0.1;
-  const content = String(chunk.content || "").trim();
+  const content = limitChunkSize(String(chunk.content || "").trim(), CHUNK_TOKENS_MAX);
   const keywords = Array.isArray(chunk.keywords)
     ? chunk.keywords.map(String)
     : extractKeywords(content);
@@ -255,7 +377,7 @@ function normalizeApiChunk(chunk, index) {
     gravity,
     tier,
     previousTier: tier,
-    tokens: Math.max(30, Number(chunk.tokens) || estimateTokens(content)),
+    tokens: Math.max(30, Math.min(CHUNK_TOKENS_MAX, Number(chunk.tokens) || estimateTokens(content))),
     accessCount: 0,
     lastPromotedAt: null,
     lastChangedAt: null,
@@ -380,7 +502,6 @@ async function assemblePrompt(query, vector, momentum) {
       "REFILL",
       `best=${bestGravity.toFixed(2)} threshold=0.75`,
     );
-    renderEventLog();
     try {
       const refill = await apiPost("/api/refill", {
         query,
@@ -431,11 +552,13 @@ async function assemblePrompt(query, vector, momentum) {
     );
   }
   const promptContext = `GCF MEMORY CONTEXT\n${lines.join("\n")}\n\nQUERY: ${query}`;
+  state.lastPromptContext = promptContext;
+  state.lastSelectedContextIds = selected.map((chunk) => chunk.id);
   if (refs.promptContext) {
     refs.promptContext.textContent = promptContext;
   }
   const cited = selected.slice(0, 4);
-  if (refs.answer) refs.answer.textContent = "Calling LLM for final answer...";
+  addEvent("FIELD-UPDATE", "ANSWER", "calling base model");
   addEvent(
     "FIELD-UPDATE",
     "CHUNKING",
@@ -453,30 +576,24 @@ async function assemblePrompt(query, vector, momentum) {
     query,
     responseChunk.id,
   );
+  const writtenResponseChunks = writeResponseChunksToMemory(
+    responseSubChunks,
+    vector,
+  );
   addEvent(
     "FIELD-UPDATE",
     "CHUNKING",
     `created ${responseSubChunks.length} response sub-chunks`,
   );
-  const answerHtml = renderAnswerHtml(
-    llmAnswer,
-    cited,
-    responseChunk,
-    responseSubChunks,
-  );
-  if (refs.answer) refs.answer.innerHTML = answerHtml;
+  const answerHtml = renderAnswerHtml(llmAnswer, cited, responseChunk);
   state.outputs.unshift({
     query,
+    answerText: llmAnswer,
     answerHtml,
-    answerChunks: cited.map((chunk) => ({
-      id: chunk.id,
-      cluster: chunk.cluster,
-      content: chunk.content,
-      gravity: chunk.gravity,
-      tier: chunk.tier,
-    })),
-    responseSubChunks,
+    memoryWrites: [responseChunk.id, ...writtenResponseChunks.map((c) => c.id)],
     citedIds: cited.map((chunk) => chunk.id),
+    cachedId: responseChunk.id,
+    cachedTier: responseChunk.tier,
     at: performance.now(),
   });
   state.outputs = state.outputs.slice(0, 6);
@@ -485,65 +602,143 @@ async function assemblePrompt(query, vector, momentum) {
 }
 
 function segmentResponseIntoChunks(response, query, responseId) {
-  addEvent(
-    "FIELD-UPDATE",
-    "CHUNKING",
-    `segmenting ${response.length} chars into knowledge chunks`,
-  );
+  const normalized = String(response || "").trim();
+  addEvent("FIELD-UPDATE", "CHUNKING", `segmenting ${normalized.length} chars`);
+  if (!normalized) return [];
+
+  // Prefer paragraph structure when present; fallback to sentence boundaries.
+  const paragraphs = normalized
+    .split(/\n{2,}/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  const units =
+    paragraphs.length > 1
+      ? paragraphs
+      : normalized
+          .split(/(?<=[.!?])\s+/)
+          .map((s) => s.trim())
+          .filter((s) => s.length > 20);
+
   const chunks = [];
-
-  // Split by sentences or paragraphs
-  const sentences = response
-    .split(/(?<=[.!?])\s+/)
-    .filter((s) => s.trim().length > 20);
-
-  // Group sentences into meaningful chunks (100-150 tokens)
-  let currentChunk = "";
+  let current = "";
   let chunkIndex = 0;
 
-  for (const sentence of sentences) {
-    const combined = currentChunk ? `${currentChunk} ${sentence}` : sentence;
-    const tokens = estimateTokens(combined);
-
-    if (tokens > 120 && currentChunk) {
-      // Create chunk with current content
-      chunks.push({
-        id: `${responseId}-${String(chunkIndex + 1).padStart(2, "0")}`,
-        cluster: "response-segment",
-        keywords: extractKeywords(currentChunk),
-        content: currentChunk.trim(),
-        tokens: estimateTokens(currentChunk),
-      });
-      currentChunk = sentence;
-      chunkIndex++;
-    } else {
-      currentChunk = combined;
-    }
-  }
-
-  // Add final chunk
-  if (currentChunk.trim()) {
+  const flush = () => {
+    const text = current.trim();
+    if (!text) return;
     chunks.push({
       id: `${responseId}-${String(chunkIndex + 1).padStart(2, "0")}`,
       cluster: "response-segment",
-      keywords: extractKeywords(currentChunk),
-      content: currentChunk.trim(),
-      tokens: estimateTokens(currentChunk),
+      keywords: extractKeywords(text),
+      content: text,
+      tokens: estimateTokens(text),
     });
+    chunkIndex += 1;
+    current = "";
+  };
+
+  const emitHardSplits = (text) => {
+    const parts = splitTextIntoMaxTokenChunks(text, CHUNK_TOKENS_MAX);
+    for (const part of parts) {
+      current = part;
+      flush();
+    }
+    current = "";
+  };
+
+  for (const unit of units) {
+    const combined = current ? `${current}\n${unit}` : unit;
+    const combinedTokens = estimateTokens(combined);
+
+    if (combinedTokens > CHUNK_TOKENS_MAX) {
+      if (estimateTokens(current) >= CHUNK_TOKENS_MIN) {
+        flush();
+        current = "";
+      }
+      // Unit (or combined) is too large; emit it as one-or-more hard splits.
+      emitHardSplits(unit);
+      continue;
+    }
+
+    // Flush when we hit target sizing (keeps chunks near-uniform).
+    if (
+      combinedTokens >= CHUNK_TOKENS_TARGET &&
+      estimateTokens(current) >= CHUNK_TOKENS_MIN
+    ) {
+      flush();
+      current = unit;
+      continue;
+    }
+
+    current = combined;
+  }
+  flush();
+
+  // Merge tiny trailing chunk into previous.
+  if (chunks.length > 1) {
+    const last = chunks[chunks.length - 1];
+    const prev = chunks[chunks.length - 2];
+    if (last.tokens < Math.floor(CHUNK_TOKENS_MIN * 0.55) && prev.tokens < CHUNK_TOKENS_MAX) {
+      prev.content = `${prev.content}\n${last.content}`.trim();
+      prev.tokens = estimateTokens(prev.content);
+      prev.keywords = extractKeywords(prev.content);
+      chunks.pop();
+    }
   }
 
   addEvent(
     "FIELD-UPDATE",
     "CHUNKING",
-    `generated ${chunks.length} chunks: ${chunks.map((c) => c.id).join(", ")}`,
+    `generated ${chunks.length} chunks`,
   );
   return chunks;
+}
+
+function writeResponseChunksToMemory(responseSubChunks, queryVector) {
+  if (!Array.isArray(responseSubChunks) || responseSubChunks.length === 0) return [];
+  const now = performance.now();
+  const written = [];
+
+  for (const sub of responseSubChunks) {
+    const standardized = limitChunkSize(String(sub.content || ""), CHUNK_TOKENS_MAX);
+    const vector = textVector(standardized);
+    const pull = Math.max(0, cosine(queryVector, vector));
+    const gravity = clamp(0.52 + pull * 0.42, 0.25, 0.92);
+    const tier = tierForGravity(gravity);
+    const chunk = {
+      id: sub.id,
+      index: state.committedChunks.length,
+      cluster: sub.cluster || "response-segment",
+      keywords: Array.isArray(sub.keywords) ? sub.keywords : extractKeywords(standardized),
+      content: standardized,
+      vector,
+      gravity,
+      tier,
+      previousTier: 4,
+      tokens: Math.max(20, Math.min(CHUNK_TOKENS_MAX, Number(sub.tokens) || estimateTokens(standardized))),
+      accessCount: 1,
+      lastPromotedAt: now,
+      lastChangedAt: now,
+      flashUntil: now + 2000,
+      gravityHistory: [gravity],
+    };
+    state.committedChunks.push(chunk);
+    written.push(chunk);
+    addEvent("PAGE-IN", chunk.id, `response chunk L${tier} gravity=${gravity.toFixed(2)}`);
+  }
+
+  state.chunks = cloneChunks(state.committedChunks);
+  return written;
 }
 
 function addResponseMemoryChunk(query, answer, queryVector) {
   const index = state.committedChunks.length;
   const id = `R${String(state.outputs.length + 1).padStart(4, "0")}`;
-  const content = `User asked: ${query} Answer: ${answer}`;
+  const content = limitChunkSize(
+    `User asked: ${query}\nAnswer:\n${String(answer || "").trim()}`,
+    CHUNK_TOKENS_MAX,
+  );
   const vector = textVector(content);
   const pull = Math.max(0, cosine(queryVector, vector));
   const gravity = clamp(0.62 + pull * 0.3, 0, 0.92);
@@ -579,7 +774,6 @@ function renderAnswerHtml(
   answer,
   cited,
   responseChunk,
-  responseSubChunks = [],
 ) {
   const citations = cited
     .map(
@@ -588,31 +782,6 @@ function renderAnswerHtml(
     )
     .join(" ");
 
-  const subChunksHtml =
-    responseSubChunks.length > 0
-      ? `
-    <div class="response-sub-chunks">
-      <div class="sub-chunks-label">Response decomposed into ${responseSubChunks.length} knowledge chunks:</div>
-      <div class="sub-chunks-grid">
-        ${responseSubChunks
-          .map(
-            (chunk) => `
-          <div class="sub-chunk-item" style="border-color: color-mix(in srgb, #14b8a6 30%, var(--line-soft))">
-            <div class="sub-chunk-header">
-              <span class="sub-chunk-id">${escapeHtml(chunk.id)}</span>
-              <span style="color: var(--muted); font-size: 8px">●</span>
-              <span style="color: var(--muted); font-size: 9px">${chunk.cluster}</span>
-            </div>
-            <div class="sub-chunk-content">${escapeHtml(chunk.content)}</div>
-          </div>
-        `,
-          )
-          .join("")}
-      </div>
-    </div>
-  `
-      : "";
-
   return `
     <article class="response-card">
       <header>
@@ -620,7 +789,6 @@ function renderAnswerHtml(
         <strong class="mono">${responseChunk.id} stored in L${responseChunk.tier}</strong>
       </header>
       <div class="response-body">${formatAnswerText(answer)}</div>
-      ${subChunksHtml}
       <footer>
         <span>Cited chunks:</span>
         ${citations}
@@ -705,10 +873,7 @@ function render() {
   renderStats();
   renderMemoryMap();
   renderHeatmap();
-  renderTurnPills();
   renderQueryOutputs();
-  renderInspector();
-  renderEventLog();
   bindCitationButtons();
 }
 
@@ -816,10 +981,7 @@ function renderQueryOutputs() {
   state.outputs.forEach((output, index) => {
     const card = document.createElement("article");
     card.className = "query-output";
-
-    // Extract response chunks if available
-    const answerChunks = output.answerChunks || [];
-    const hasChunks = answerChunks.length > 0;
+    const writes = Array.isArray(output.memoryWrites) ? output.memoryWrites : [];
 
     card.innerHTML = `
       <div class="output-head">
@@ -840,96 +1002,27 @@ function renderQueryOutputs() {
           </div>
         </div>
         ${
-          hasChunks
+          writes.length
             ? `
         <div class="output-section" style="--tier-color: var(--l1)">
-          <div class="output-section-head" style="background: color-mix(in srgb, var(--l1) 12%, #0b111d); color: var(--l1)">CONTEXT CHUNKS USED</div>
-          <div class="output-chunk-list">
-            ${answerChunks
-              .map(
-                (chunk, i) => `
-              <div class="output-chunk-item" style="border-color: color-mix(in srgb, var(--l1) 30%, var(--line-soft)); background: color-mix(in srgb, var(--l1) 8%, #0b111d)">
-                <div class="output-chunk-item-header">
-                  <span class="output-chunk-id">${escapeHtml(chunk.id)}</span>
-                  <span style="color: var(--muted); font-size: 8px">●</span>
-                  <span style="color: var(--muted); font-size: 9px">${chunk.cluster}</span>
-                </div>
-                <div class="output-chunk-content">${escapeHtml(chunk.content.substring(0, 100))}${chunk.content.length > 100 ? "…" : ""}</div>
-              </div>
-            `,
-              )
-              .join("")}
+          <div class="output-section-head" style="background: color-mix(in srgb, var(--l1) 12%, #0b111d); color: var(--l1)">MEMORY WRITES</div>
+          <div class="output-section-content">
+            ${writes
+              .map((id) => `<button class="citation" data-chunk-id="${escapeHtml(id)}" type="button">${escapeHtml(id)}</button>`)
+              .join(" ")}
           </div>
-        </div>
-        `
+        </div>`
             : ""
         }
       </div>
     `;
+
     refs.queryOutputs.appendChild(card);
   });
 }
 
-function renderTurnPills() {
-  refs.turnPills.innerHTML = "";
-  const turns = state.turns.slice(-3);
-  if (!turns.length) {
-    refs.turnPills.innerHTML = `<span class="empty">No committed turns yet. Typing in the input will preview field gravity.</span>`;
-    return;
-  }
-  for (const turn of turns) {
-    const pill = document.createElement("div");
-    pill.className = "turn-pill";
-    pill.innerHTML = `<span>${turn.text}</span><strong class="mono">momentum: ${turn.momentum.toFixed(2)}</strong>`;
-    refs.turnPills.appendChild(pill);
-  }
-}
-
-function renderInspector() {
-  const chunk =
-    state.chunks.find((item) => item.id === state.selectedId) ||
-    state.chunks[0];
-  if (!chunk) {
-    refs.selectedBadge.textContent = "none";
-    refs.inspector.innerHTML = `<p>No chunks loaded. Configure <span class="mono">OPENAI_API_KEY</span> and restart the local server.</p>`;
-    return;
-  }
-  refs.selectedBadge.textContent = chunk.id;
-  refs.selectedBadge.style.borderColor = TIER_META[chunk.tier].color;
-  refs.inspector.innerHTML = `
-    <div class="inspect-id">
-      <span class="mono">${chunk.id}</span>
-      <strong style="color:${TIER_META[chunk.tier].color}">L${chunk.tier}</strong>
-    </div>
-    <p>${chunk.content.slice(0, 118)}...</p>
-    <dl>
-      <div><dt>cluster</dt><dd>${chunk.cluster}</dd></div>
-      <div><dt>gravity</dt><dd class="mono glow" style="color:${TIER_META[chunk.tier].color}">${chunk.gravity.toFixed(3)}</dd></div>
-      <div><dt>access count</dt><dd class="mono">${chunk.accessCount}</dd></div>
-      <div><dt>last promoted</dt><dd class="mono">${formatStamp(chunk.lastPromotedAt)}</dd></div>
-      <div><dt>tokens</dt><dd class="mono">${chunk.tokens}</dd></div>
-    </dl>
-    <div class="spark-wrap">
-      <span class="mono">gravity last 8 turns</span>
-      ${sparkline(chunk.gravityHistory, TIER_META[chunk.tier].color)}
-    </div>
-  `;
-}
-
-function renderEventLog() {
-  refs.eventLog.innerHTML = "";
-  state.events.slice(0, 80).forEach((event) => {
-    const row = document.createElement("div");
-    row.className = `event-row ${event.type.toLowerCase()}`;
-    row.innerHTML = `<span>${event.time}</span><strong>${event.type}</strong><span>${event.target}</span><em>${event.detail}</em>`;
-    refs.eventLog.appendChild(row);
-  });
-}
-
-
 function selectChunk(id) {
   state.selectedId = id;
-  renderInspector();
   renderHeatmap();
   renderMemoryMap();
   bindCitationButtons();
@@ -941,6 +1034,7 @@ function openChunkModal(id) {
     state.committedChunks.find((item) => item.id === id);
   if (!chunk) return;
   refs.modalTitle.textContent = `${chunk.id} · ${chunk.cluster}`;
+  const contextLines = buildContextLinesForModal();
   refs.modalBody.innerHTML = `
     <div class="modal-meta">
       <span class="mono" style="color:${TIER_META[chunk.tier].color}">L${chunk.tier}</span>
@@ -950,11 +1044,18 @@ function openChunkModal(id) {
     </div>
     <h3>Knowledge Held</h3>
     <p>${escapeHtml(chunk.content)}</p>
-    <h3>Embedding Cluster</h3>
-    <p>${escapeHtml(chunk.keywords.join(", "))}</p>
+    <h3>Current Prompt Context (From Memory)</h3>
+    <pre class="modal-context mono">${escapeHtml(contextLines || "No prompt context assembled yet. Submit a query first.")}</pre>
+    <h3>Keywords</h3>
+    <p class="mono">${escapeHtml(chunk.keywords.join(", "))}</p>
     <div class="modal-spark">${sparkline(chunk.gravityHistory, TIER_META[chunk.tier].color)}</div>
   `;
   refs.modal.showModal();
+}
+
+function buildContextLinesForModal() {
+  if (!state.lastPromptContext) return "";
+  return state.lastPromptContext;
 }
 
 function bindCitationButtons() {
@@ -1083,6 +1184,32 @@ function extractKeywords(text) {
 
 function estimateTokens(text) {
   return Math.ceil(String(text).split(/\s+/).filter(Boolean).length * 1.25);
+}
+
+function limitChunkSize(text, maxTokens) {
+  const normalized = String(text || "").trim();
+  if (!normalized) return "";
+  if (estimateTokens(normalized) <= maxTokens) return normalized;
+
+  // Approx invert of estimateTokens() => tokens ~= words * 1.25
+  const maxWords = Math.max(12, Math.floor(maxTokens / 1.25));
+  const words = normalized.split(/\s+/).filter(Boolean);
+  const trimmed = words.slice(0, maxWords).join(" ");
+  return trimmed.trim().replace(/[\s\n]+$/g, "");
+}
+
+function splitTextIntoMaxTokenChunks(text, maxTokens) {
+  const normalized = String(text || "").trim();
+  if (!normalized) return [];
+  if (estimateTokens(normalized) <= maxTokens) return [normalized];
+  const maxWords = Math.max(12, Math.floor(maxTokens / 1.25));
+  const words = normalized.split(/\s+/).filter(Boolean);
+  const parts = [];
+  for (let i = 0; i < words.length; i += maxWords) {
+    const part = words.slice(i, i + maxWords).join(" ").trim();
+    if (part) parts.push(part);
+  }
+  return parts;
 }
 
 function conceptBoost(text) {
